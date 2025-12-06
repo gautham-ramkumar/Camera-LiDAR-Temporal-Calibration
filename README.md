@@ -1,4 +1,4 @@
-# Camera-Lidar-Temporal-Calibration By Group 1
+# Camera-Lidar-Temporal-Calibration
 
 ### Details About The Files
 - <b>Camera_Lidar_Temporal_Calibration.ipynb -</b> This is the main joint optimization pipeline used for the temporal calibration. This file includes the imu preintegration pipeline, lidar pipeline, the camera pipeline, the joint optimization code, and all the results.
