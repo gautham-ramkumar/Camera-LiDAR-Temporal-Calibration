@@ -1,0 +1,9 @@
+numpy
+opencv-python
+scipy
+matplotlib
+mcap
+mcap-ros2-support
+tqdm
+jupyter
+ipykernel

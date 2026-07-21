@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+"""MCAP time-window extractor for camera, LiDAR, and IMU topics."""
 
 from mcap.reader import make_reader
 from mcap_ros2.decoder import DecoderFactory
@@ -88,21 +88,30 @@ class McapTimeWindowExtractor:
                 with tqdm(desc="Extracting", unit="msg") as pbar:
                     for schema, channel, message, ros_msg in reader2.iter_decoded_messages():
                         topic = channel.topic
-                        timestamp_ns = message.log_time
-                        
-                        # Skip if outside time window
-                        if self.window_start_ns is not None and timestamp_ns < self.window_start_ns:
+                        log_time_ns = message.log_time
+
+                        # Skip if outside time window (use log_time for windowing)
+                        if self.window_start_ns is not None and log_time_ns < self.window_start_ns:
                             continue
-                        if self.window_end_ns is not None and timestamp_ns > self.window_end_ns:
+                        if self.window_end_ns is not None and log_time_ns > self.window_end_ns:
                             break
-                        
+
                         # Process message if it's a topic we care about
                         handler = self._topic_handlers.get(topic)
                         if handler is None:
                             continue
-                        
-                        timestamp_sec = timestamp_ns * 1e-9
-                        handler(ros_msg, timestamp_sec, timestamp_ns)
+
+                        # Use header.stamp for the sensor timestamp so that
+                        # camera pipeline latency (~400-500 ms for compressed
+                        # images) does not get absorbed into tau.
+                        try:
+                            hdr = ros_msg.header.stamp
+                            ts_ns = int(hdr.sec) * 1_000_000_000 + int(hdr.nanosec)
+                            timestamp_sec = ts_ns * 1e-9 if ts_ns > 0 else log_time_ns * 1e-9
+                        except AttributeError:
+                            timestamp_sec = log_time_ns * 1e-9
+
+                        handler(ros_msg, timestamp_sec, log_time_ns)
                         
                         messages_in_window += 1
                         pbar.update(1)
@@ -187,59 +196,28 @@ class McapTimeWindowExtractor:
 
     @staticmethod
     def _decode_pointcloud2(cloud_msg) -> np.ndarray:
-        """
-        Properly decode PointCloud2 by respecting point_step and field offsets
-        """
-        # Find X, Y, Z field offsets
-        field_map = {}
-        for field in cloud_msg.fields:
-            if field.name in ['x', 'y', 'z']:
-                field_map[field.name] = field.offset
-        
+        """Decode PointCloud2 using a numpy structured dtype — no Python loops."""
+        field_map = {f.name: f.offset for f in cloud_msg.fields if f.name in ('x', 'y', 'z')}
         if len(field_map) != 3:
             raise ValueError(f"PointCloud2 missing XYZ fields. Found: {[f.name for f in cloud_msg.fields]}")
-        
-        # Get point step (bytes per point)
+
         point_step = cloud_msg.point_step
-        num_points = cloud_msg.width * cloud_msg.height
-        
-        # Ensure we have enough data
-        expected_size = num_points * point_step
-        actual_size = len(cloud_msg.data)
-        
-        if actual_size < expected_size:
-            num_points = actual_size // point_step
-        
-        # Create output array
-        points = np.zeros((num_points, 3), dtype=np.float32)
-        
-        # Convert data to numpy array
-        data_array = np.frombuffer(cloud_msg.data, dtype=np.uint8)
-        
-        # Extract each coordinate at its proper offset
-        for i, coord_name in enumerate(['x', 'y', 'z']):
-            offset = field_map[coord_name]
-            
-            # Create indices for all points at this coordinate's offset
-            indices = np.arange(num_points) * point_step + offset
-            
-            # Extract float32 values
-            for pt_idx, byte_idx in enumerate(indices):
-                if byte_idx + 4 <= len(data_array):
-                    # Read 4 bytes as float32
-                    points[pt_idx, i] = np.frombuffer(
-                        data_array[byte_idx:byte_idx+4].tobytes(), 
-                        dtype=np.float32
-                    )[0]
-        
-        # Filter invalid points
-        valid_mask = np.all(np.isfinite(points), axis=1)
-        valid_points = points[valid_mask]
-        
-        # Remove exact zeros (common invalid marker)
-        non_zero_mask = ~np.all(valid_points == 0, axis=1)
-        
-        return valid_points[non_zero_mask]
+        num_points = min(
+            cloud_msg.width * cloud_msg.height,
+            len(cloud_msg.data) // point_step,
+        )
+
+        dt = np.dtype({
+            'names':   ['x', 'y', 'z'],
+            'formats': [np.float32, np.float32, np.float32],
+            'offsets': [field_map['x'], field_map['y'], field_map['z']],
+            'itemsize': point_step,
+        })
+        structured = np.frombuffer(bytes(cloud_msg.data), dtype=dt, count=num_points)
+        points = np.column_stack([structured['x'], structured['y'], structured['z']])
+
+        valid = np.isfinite(points).all(axis=1) & ~(points == 0).all(axis=1)
+        return points[valid]
 
 # if __name__ == "__main__":
 #     # Example 1: Extract 5 seconds starting from 10 seconds into the bag

@@ -1,27 +1,61 @@
-# Camera-Lidar-Temporal-Calibration
+# Camera–LiDAR Hybrid Temporal Sync
 
-### Details About The Files
-- <b>Camera_Lidar_Temporal_Calibration.ipynb -</b> This is the main joint optimization pipeline used for the temporal calibration. This file includes the imu preintegration pipeline, lidar pipeline, the camera pipeline, the joint optimization code, and all the results.
-- <b>cam_lidar_extrinsics_calibration_gui.py -</b> This file was used to find the extrinsics (Rotation and Translation) between the camera and the lidar.
-- <b>utils/extract_topics.py -</b> This file was used to extract data for a duration of 5 seconds (from t = 10 seconds to t = 15 seconds).
-- <b>Individual_Pipelines/Camera_Pipeline.ipynb -</b> This contains code for the camera pipeline.
-- <b>Individual_Pipelines/imu_utils.py -</b> This contains code for the imu preintegration pipeline. 
-- <b>Individual_Pipelines/lidar.py -</b> This contains the code for the lidar pipeline. 
+Stamp-primary temporal sync with paper-closer residual path (Wang et al. [arXiv:2207.10454](papers/2207.10454.pdf)), plus upgrades that avoid the paper’s soft-sync / free-search failure modes.
 
-### We referred to the "Temporal and Spatial Online Integrated Calibration for Camera and LiDAR" paper.
-<b>Link:</b> https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=9921858
+## Model
 
-### We used the Huntington.mcap dataset collected using the Hunter Robot.
+| Layer | Role |
+|-------|------|
+| `tau_stamp` | **Primary sync** — median nearest camera−LiDAR stamp |
+| `tau_res` | Edge residual in ±50 ms around stamps (EMA), optional IMU warp + dynamic filter |
+| `tau_sync` | **Operational** — \(t_C \approx t_L + \tau_{sync}\) |
+| `tau_unconst` | **Diagnostic only** — unconstrained score peak / alias flag |
+| `T_CL` | Stiff prior + optional slow refine (±2°, ±5 cm) |
 
-### Please find the dataset and one of the lidar pipeline videos in the drive folder below. 
+## Example outputs
 
-### All other results are in the ``Camera_Lidar_Temporal_Calibration.ipynb`` notebook.
+Notebook figures below follow the visual conventions of Wang et al. (arXiv:2207.10454) — grayscale image / Canny edges / distance transform triptychs, and uniform-green LiDAR points projected onto the raw image, rather than a distance-colored heatmap.
 
-<b>Link:</b> https://northeastern-my.sharepoint.com/:f:/g/personal/lnu_arya_northeastern_edu/Evg01v-PZ55OlbbXd4s0plABuoYSmBLUiZFQTHmBUVXfzg?e=HdgJds
+**Camera edges + distance transform** (§4 — `image | Canny edges | distance transform`, cf. Fig. 1b):
 
+![Camera edges and distance transform](assets/cam.png)
 
+**Projected LiDAR points across candidate offsets** (§8 — bad / stamp-primary / operational-sync comparison, cf. Fig. 1c / Fig. 8):
 
+![Paper-style LiDAR projection comparison](assets/output.png)
 
+**Per-window score / tau / residual convergence** (§6 — 15 sliding windows over 750 LiDAR scans, cf. Fig. 6):
 
+![Hybrid sync score, tau, and residual evaluation](assets/calibration_eval.png)
 
+## Layout
 
+```
+Calibration/
+├── assets/                # README figures (edge/DT triptych, projection comparison, score/tau plots)
+├── calib/
+│   ├── extract.py, imu.py, lidar.py, camera.py
+│   ├── geometry.py, scoring.py
+│   ├── pose_warp.py, lines.py, dynamic_filter.py, extrinsic_refine.py
+│   ├── hybrid_sync.py, viz.py
+├── papers/2207.10454.pdf, REFERENCES.md
+├── Camera_Lidar_Hybrid_Sync.ipynb
+├── huntington.mcap
+└── requirements.txt
+```
+
+## Setup
+
+```bash
+cd ~/Desktop/AFR/Calibration
+pip install -r requirements.txt
+jupyter notebook Camera_Lidar_Hybrid_Sync.ipynb
+```
+
+## Notebook flags
+
+- `USE_POSE_WARP` — IMU \(T_v\) warp (paper-style)
+- `USE_DYNAMIC_FILTER` — adjacent-frame NN dynamic removal
+- `USE_LSD` — LSD lines (else Canny DT)
+- `REFINE_EXTRINSICS` — slow stiff \(T_e\) refine
+- `RESIDUAL_BAND` — default ±0.05 s around stamps
