@@ -12,9 +12,9 @@ class McapTimeWindowExtractor:
     def __init__(
         self,
         mcap_path: str,
-        camera_topic: str,
-        lidar_topic: str,
-        imu_topic: str,
+        camera_topic: Optional[str],
+        lidar_topic: Optional[str],
+        imu_topic: Optional[str],
         start_time: Optional[float] = None,  # seconds from start of bag
         duration: Optional[float] = None      # duration in seconds
     ):
@@ -35,11 +35,14 @@ class McapTimeWindowExtractor:
         self.window_start_ns = None
         self.window_end_ns = None
         
-        self._topic_handlers = {
-            self.camera_topic: self._process_camera,
-            self.lidar_topic: self._process_lidar,
-            self.imu_topic: self._process_imu,
-        }
+        # Skip None topics so a camera-only (or lidar-only) pass can omit unused streams.
+        self._topic_handlers = {}
+        if self.camera_topic:
+            self._topic_handlers[self.camera_topic] = self._process_camera
+        if self.lidar_topic:
+            self._topic_handlers[self.lidar_topic] = self._process_lidar
+        if self.imu_topic:
+            self._topic_handlers[self.imu_topic] = self._process_imu
 
     def extract(self) -> None:
         print(f"Reading MCAP: {self.mcap_path}")

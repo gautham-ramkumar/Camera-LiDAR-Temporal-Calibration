@@ -117,6 +117,52 @@ def associate_camera_time(t_lidar: float, tau_sync: float) -> float:
     return float(t_lidar) + float(tau_sync)
 
 
+def _filtered_points(
+    lidar_scans: List[dict],
+    indices: np.ndarray,
+    imu: Optional[IMUPreintegrator],
+    imu_measurements: Optional[List[dict]],
+    use_dynamic_filter: bool,
+) -> Optional[dict]:
+    """Tau-independent part of point preparation (dynamic-object filter)."""
+    if use_dynamic_filter and imu is not None and imu_measurements:
+        return apply_dynamic_filter_to_scans(lidar_scans, indices, imu, imu_measurements)
+    return None
+
+
+def _warp_points(
+    lidar_scans: List[dict],
+    indices: np.ndarray,
+    base: Optional[dict],
+    tau: float,
+    imu: Optional[IMUPreintegrator],
+    imu_measurements: Optional[List[dict]],
+    use_warp: bool,
+    max_points: int,
+) -> Optional[dict]:
+    """Tau-dependent part: warp (optionally filtered) points to ``t_L + tau``."""
+    if not (use_warp and imu is not None and imu_measurements):
+        return base
+    if base is None:
+        warped = build_warped_point_override(
+            lidar_scans, indices, tau, imu, imu_measurements, max_points=max_points
+        )
+    else:
+        local_scans = [
+            {
+                "timestamp": lidar_scans[int(i)]["timestamp"],
+                "points": base.get(int(i), lidar_scans[int(i)]["points"]),
+            }
+            for i in indices
+        ]
+        local_idx = np.arange(len(indices))
+        local_warp = build_warped_point_override(
+            local_scans, local_idx, tau, imu, imu_measurements, max_points=max_points
+        )
+        warped = {int(indices[k]): local_warp[k] for k in local_warp}
+    return warped if warped else base
+
+
 def _prepare_points(
     lidar_scans: List[dict],
     indices: np.ndarray,
@@ -127,31 +173,38 @@ def _prepare_points(
     use_dynamic_filter: bool,
     max_points: int,
 ) -> Optional[dict]:
-    override = None
-    if use_dynamic_filter and imu is not None and imu_measurements:
-        override = apply_dynamic_filter_to_scans(
-            lidar_scans, indices, imu, imu_measurements
+    base = _filtered_points(lidar_scans, indices, imu, imu_measurements, use_dynamic_filter)
+    return _warp_points(
+        lidar_scans, indices, base, tau, imu, imu_measurements, use_warp, max_points
+    )
+
+
+def _override_fn(
+    lidar_scans: List[dict],
+    indices: np.ndarray,
+    base: Optional[dict],
+    imu: Optional[IMUPreintegrator],
+    imu_measurements: Optional[List[dict]],
+    use_warp: bool,
+    max_points: int,
+) -> Optional[Callable[[float], Optional[dict]]]:
+    """
+    Per-candidate override builder for the residual grid search.
+
+    The pose warp Tv depends on tau (it moves points from ``t_L`` to
+    ``t_L + tau``), so every candidate needs its own warp; reusing the warp
+    computed at ``tau_stamp`` would bias the residual toward zero. Returns
+    ``None`` when warping is off, so callers fall back to the fixed ``base``.
+    """
+    if not (use_warp and imu is not None and imu_measurements):
+        return None
+
+    def fn(tau: float) -> Optional[dict]:
+        return _warp_points(
+            lidar_scans, indices, base, tau, imu, imu_measurements, use_warp, max_points
         )
-    if use_warp and imu is not None and imu_measurements:
-        if override is None:
-            warped = build_warped_point_override(
-                lidar_scans, indices, tau, imu, imu_measurements, max_points=max_points
-            )
-        else:
-            local_scans = [
-                {
-                    "timestamp": lidar_scans[int(i)]["timestamp"],
-                    "points": override.get(int(i), lidar_scans[int(i)]["points"]),
-                }
-                for i in indices
-            ]
-            local_idx = np.arange(len(indices))
-            local_warp = build_warped_point_override(
-                local_scans, local_idx, tau, imu, imu_measurements, max_points=max_points
-            )
-            warped = {int(indices[k]): local_warp[k] for k in local_warp}
-        override = warped if warped else override
-    return override
+
+    return fn
 
 
 def run_hybrid_sync(
@@ -226,9 +279,14 @@ def run_hybrid_sync(
         st_w = stamp_sync_stats(lidar_scans, cam_times, indices)
         tau_stamp_w = st_w.tau_stamp
 
-        override = _prepare_points(
-            lidar_scans, indices, tau_stamp_w, imu, imu_measurements,
-            use_pose_warp, use_dynamic_filter, max_points_per_scan,
+        # Dynamic filter is tau-independent: compute once per window. The pose
+        # warp depends on tau and is rebuilt for each residual candidate.
+        base_w = _filtered_points(
+            lidar_scans, indices, imu, imu_measurements, use_dynamic_filter
+        )
+        override = _warp_points(
+            lidar_scans, indices, base_w, tau_stamp_w, imu, imu_measurements,
+            use_pose_warp, max_points_per_scan,
         )
 
         tau_abs_best = seed_tau_grid(
@@ -237,16 +295,20 @@ def run_hybrid_sync(
             tau_min=tau_stamp_w - residual_band,
             tau_max=tau_stamp_w + residual_band,
             num_samples=residual_samples,
-            point_override=override,
+            point_override=base_w,
+            point_override_fn=_override_fn(
+                lidar_scans, indices, base_w, imu, imu_measurements,
+                use_pose_warp, max_points_per_scan,
+            ),
         )
         tau_res_obs = float(tau_abs_best - tau_stamp_w)
         tau_res = (1.0 - ema_alpha) * tau_res + ema_alpha * tau_res_obs
         tau_res = float(np.clip(tau_res, -residual_band, residual_band))
         tau_sync_w = float(tau_stamp_w + tau_res)
 
-        override_sync = _prepare_points(
-            lidar_scans, indices, tau_sync_w, imu, imu_measurements,
-            use_pose_warp, use_dynamic_filter, max_points_per_scan,
+        override_sync = _warp_points(
+            lidar_scans, indices, base_w, tau_sync_w, imu, imu_measurements,
+            use_pose_warp, max_points_per_scan,
         )
 
         score_sync = mean_alignment_score(
@@ -297,9 +359,8 @@ def run_hybrid_sync(
 
     print(f"{'='*72}")
 
-    override_f = _prepare_points(
-        lidar_scans, all_idx, tau_stamp, imu, imu_measurements,
-        use_pose_warp, use_dynamic_filter, max_points_per_scan,
+    base_f = _filtered_points(
+        lidar_scans, all_idx, imu, imu_measurements, use_dynamic_filter
     )
     tau_abs_f = seed_tau_grid(
         pipeline, lidar_scans, cam_times, frame_ids, K, T_CL, all_idx,
@@ -307,7 +368,11 @@ def run_hybrid_sync(
         tau_min=tau_stamp - residual_band,
         tau_max=tau_stamp + residual_band,
         num_samples=residual_samples,
-        point_override=override_f,
+        point_override=base_f,
+        point_override_fn=_override_fn(
+            lidar_scans, all_idx, base_f, imu, imu_measurements,
+            use_pose_warp, max_points_per_scan,
+        ),
     )
     tau_res = float(np.clip(tau_abs_f - tau_stamp, -residual_band, residual_band))
     tau_sync = float(tau_stamp + tau_res)

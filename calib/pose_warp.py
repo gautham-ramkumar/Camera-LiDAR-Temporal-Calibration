@@ -10,6 +10,34 @@ from .geometry import transform_points
 from .imu import IMUPreintegrator
 
 
+def _lower_bound(imu_measurements: List[dict], t: float) -> int:
+    """First index whose ``timestamp_sec`` >= ``t`` (list assumed time-sorted)."""
+    lo, hi = 0, len(imu_measurements)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if imu_measurements[mid]["timestamp_sec"] < t:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _imu_slice(imu_measurements: List[dict], t_start: float, t_end: float) -> List[dict]:
+    """
+    Measurements in ``[t_start, t_end]`` found by binary search.
+
+    ``IMUPreintegrator.preintegrate`` applies the same inclusive filter, so
+    passing the slice gives an identical result while avoiding a linear scan
+    of the whole IMU log on every call (warps are evaluated per candidate tau).
+    """
+    i0 = _lower_bound(imu_measurements, t_start)
+    i1 = i0
+    n = len(imu_measurements)
+    while i1 < n and imu_measurements[i1]["timestamp_sec"] <= t_end:
+        i1 += 1
+    return imu_measurements[i0:i1]
+
+
 def relative_motion(
     imu: IMUPreintegrator,
     imu_measurements: List[dict],
@@ -24,8 +52,10 @@ def relative_motion(
     if abs(t_to - t_from) < 1e-6:
         return np.eye(4)
     if t_to >= t_from:
-        return imu.preintegrate(imu_measurements, t_from, t_to)
-    T = imu.preintegrate(imu_measurements, t_to, t_from)
+        meas = _imu_slice(imu_measurements, t_from, t_to)
+        return imu.preintegrate(meas, t_from, t_to)
+    meas = _imu_slice(imu_measurements, t_to, t_from)
+    T = imu.preintegrate(meas, t_to, t_from)
     return np.linalg.inv(T)
 
 

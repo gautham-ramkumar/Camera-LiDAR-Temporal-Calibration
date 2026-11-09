@@ -49,10 +49,23 @@ def project_to_range_image(
     return img
 
 
-def extract_edges(grid_points: np.ndarray, threshold: float = 1.0) -> np.ndarray:
-    """Return edge points where range jumps exceed ``threshold`` meters."""
+def extract_edges(
+    grid_points: np.ndarray,
+    threshold: float = 1.0,
+    min_range: float = 1e-3,
+) -> np.ndarray:
+    """
+    Return edge points where range jumps exceed ``threshold`` meters.
+
+    Only horizontally adjacent cells that *both* hold a real return
+    (range > ``min_range``) are compared. Empty range-image cells (range 0)
+    are not treated as depth discontinuities, so rasterization holes do not
+    show up as spurious edges.
+    """
     ranges = np.linalg.norm(grid_points, axis=2)
+    valid = ranges > min_range
     diff = np.abs(np.diff(ranges, axis=1))
+    diff = np.where(valid[:, :-1] & valid[:, 1:], diff, 0.0)
     diff = np.pad(diff, ((0, 0), (0, 1)), constant_values=0)
     return grid_points[diff > threshold]
 

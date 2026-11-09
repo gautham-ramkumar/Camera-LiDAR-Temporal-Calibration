@@ -7,3 +7,4 @@ mcap-ros2-support
 tqdm
 jupyter
 ipykernel
+pytest

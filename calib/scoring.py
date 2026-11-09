@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 import numpy as np
 
@@ -157,11 +157,20 @@ def seed_tau_grid(
     tau_max: float = 0.05,
     num_samples: int = 41,
     point_override: Optional[dict] = None,
+    point_override_fn: Optional[Callable[[float], Optional[dict]]] = None,
 ) -> float:
-    """1-D grid search for tau maximizing alignment score."""
+    """
+    1-D grid search for tau maximizing alignment score.
+
+    ``point_override`` is a fixed override used for every candidate.
+    ``point_override_fn`` (if given) is called with each candidate tau and
+    takes precedence, for overrides that depend on tau (e.g. IMU pose warp
+    toward camera time ``t_L + tau``).
+    """
     taus = np.linspace(tau_min, tau_max, num_samples)
     best_tau, best_score = 0.0, -np.inf
     for t in taus:
+        ov = point_override_fn(float(t)) if point_override_fn is not None else point_override
         s = mean_alignment_score(
             pipeline,
             lidar_scans,
@@ -172,7 +181,7 @@ def seed_tau_grid(
             float(t),
             scan_indices=scan_indices,
             max_points_per_scan=max_points_per_scan,
-            point_override=point_override,
+            point_override=ov,
         )
         if s > best_score:
             best_score = s
