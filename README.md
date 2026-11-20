@@ -14,9 +14,9 @@ Time convention (same sign as the old `tau`): `t_C = t_L + Δt`, so an image sta
 6. **Validation** (`scripts/run_joint_calibration.py`): frame bootstrap and Gauss–Newton covariance, Δt cost profiles (pose fixed and pose re-optimised) over ±250 ms, per-window Δt, a scan-level-time ablation, a 5 cm translation-prior sensitivity run, semi-synthetic recovery, train (0–50 s) vs held-out (52–75 s) edge distance, overlays.
 
 ```bash
-python scripts/run_joint_calibration.py --mcap huntington.mcap   # ≈ 4–5 min after the first cache build
-# outputs/joint/{metrics.json,T_CL_joint.json,dt_profile.png,confound.png,bootstrap.png,
-#                per_window_and_ego_motion.png,overlays/*.png}
+python scripts/run_joint_calibration.py --mcap huntington.mcap   # pinhole baseline → outputs/joint/
+python scripts/run_joint_calibration.py --mcap huntington.mcap --dist-model k1_k2 --k2-prior 0.3 --out outputs/joint_distortion
+python scripts/reconcile_time_offset.py                         # → assets/time_offset_reconciliation.png
 pytest -q
 ```
 
@@ -44,9 +44,26 @@ Train block 0–50 s (125 frames, ~30k edge points, speed p10–p90 0.7–2.6 m/
 
 - **Alias:** with the joint pose the Δt cost has one minimum (+20 ms on a 5 ms grid, same on held-out data); −120 ms is not a local minimum. With the old two-stage pose the same cost still leans toward ≈ −100 ms, which is where the old alias came from.
 - **Confound:** if Δt is held at a wrong value, the fit absorbs it mainly in tz (≈ −1.4 mm per ms; rotation < 0.001°/ms). Holding Δt at the stamp value (37.8 ms off) moves tz by ~5 cm. In the joint fit corr(Δt, tz) is −0.27 (Gauss–Newton) / −0.06 (bootstrap); every |corr(Δt, ·)| ≤ 0.27.
-- **Why the stamp value is not the offset:** the Ouster sweep starts at the header stamp and reaches the camera's field of view ≈ 75–80 ms later. A scan-level time model (every point at the header stamp) has to put that sweep delay into Δt and pins at the +60 ms bound; per-point times remove it. In a synthetic test the scan-level model mis-estimates the pose by 2.0° / 13 cm while per-point deskew recovers it to 0.03° / 0.5 mm / 0.001 ms.
-- **Per-window Δt** (15 × 5 s, pose fixed): σ 11.5 ms over moving windows; the one near-stationary window (≈50 s, 0.3 m/s) is unobservable (−42 ms). Expected scatter for ~12 frames given the 3.5 ms full-data σ.
-- **Caveats:** no ground truth; pinhole K from the notebook with no distortion (an exploratory k1 fit gave Δt ≈ 15 ms and slightly lower held-out error); translation is the weakest part (ty/tz σ 3–5 cm) and moves 32 cm from the hand-set guess, which looks like slider values and should be checked against the physical mount; deskew relies on LiDAR odometry (speed matches u-blox GPS with r = 0.89, median ratio 1.07); the platform is slow (≤ 3.7 m/s), so Δt is observed mostly through turning.
+- **Why the stamp value (`-19.49 ms`) is not the offset (`+16.9 ms`):** see [docs/time_offset_reconciliation.md](docs/time_offset_reconciliation.md) (`scripts/reconcile_time_offset.py`). Ouster `header.stamp` is scan start (`t_rel = 0`), the forward camera FOV is swept at `t_rel = 73.5 ms` (`+95.6°` azimuth), and `cam0` runs at 20 Hz (`50 ms` lattice), so `-19.49 ms` is purely the nearest-stamp phase modulo `50 ms` relative to scan start. Per-point deskew removes the `73.5 ms` sweep delay (whereas scan-level time has to absorb it and hits the `+60 ms` bound), leaving `Δt_joint` to measure the residual `s_C − t_exp` latency. Independent camera rotational optical flow vs VectorNav (`+10 ms`, `r = 0.92`) and Ouster IMU (`+6 ms`, `r = 0.91`) confirms the positive sign.
+- **Per-window Δt** (15 × 5 s, pose fixed): σ 11.5 ms over moving windows (pinhole); with `k1_k2` distortion, `σ = 10.6 ms` over moving windows (`15 × 5 s`), and 12/13 multi-starts agree within `0.09°`, `40 mm`, `2.0 ms`.
+
+### Lens distortion (`outputs/joint_distortion/`)
+
+`huntington.mcap` `/cam_sync/cam0/camera_info` has empty calibration (`width=0`, `K=0`, `D=[]`), so radial distortion `(k1, k2)` is estimated jointly with `(R, t, Δt)` using a 20 px border margin (since barrel distortion pulls outer rays inward) and a weak zero-mean prior on `k2` (`σ_k2 = 0.30`) to prevent `r²`/`r⁴` collinearity from pushing `k2` near `+1.0`:
+
+| Model (same `margin_px = 20`) | `rpy` (deg) | `t` (m) | `Δt` (ms) | `dist` | train / test / fast-turn (px) |
+|---|---|---|---|---|---|
+| Pinhole (`none`) | 91.54 / 3.08 / 0.32 | (0.058, −0.094, +0.129) | +16.00 | — | 2.92 / 3.26 / 4.24 |
+| `k1` only (free) | 91.52 / 2.86 / −0.07 | (0.099, −0.104, −0.177) | +16.80 | `k1 = −0.334` | 2.93 / 2.87 / 3.61 |
+| `k1_k2` (free) | 91.55 / 2.84 / −0.07 | (0.101, −0.101, −0.224) | +15.80 | `k1 = −0.528, k2 = +0.971` (near bound) | 2.89 / 2.76 / 3.63 |
+| **`k1_k2` (`σ_k2 = 0.3`, chosen)** | **91.50 / 2.85 / −0.05** ± 0.03 / 0.04 / 0.07 | **(0.099, −0.106, −0.178)** ± (0.005, 0.005, 0.031) | **+16.94 ± 2.42** | **`k1 = −0.344 ± 0.022, k2 = +0.079 ± 0.022`** | **2.93 / 2.85 / 3.52** |
+| `k1_k2_p1_p2` (reg) | 91.56 / 2.88 / −0.03 | (0.103, −0.096, −0.212) | +13.59 | `[−0.381, +0.133, +0.001, −0.005]` | 2.90 / 2.98 / 3.71 |
+
+- **Where `Δt` settles:** **`+16.94 ± 2.42 ms`** (within 1σ of pinhole `+18.28 ± 3.52 ms`, and `+0.94 ms` vs `margin=20` pinhole `+16.00 ms`). `corr(Δt, k1) = +0.035` (GN) / `+0.139` (bootstrap); `corr(Δt, k2) = −0.023` (GN) / `−0.133` (bootstrap).
+- **Pose change:** Adding barrel distortion stops the pinhole fit from pushing `tz` ~30 cm forward (`+0.114..+0.129 m`) to mimic edge shrinkage; `tz` returns to **`−0.178 m`** (within 4.7 cm of `T0`’s `−0.132 m`), while rotation shifts by `~0.4°` (`yaw` `0.32° → −0.05°`, `pitch` `3.06° → 2.85°`).
+- **Held-out accuracy:** Overall held-out median edge distance drops **12.5%** (`3.262 → 2.854 px`, or `−12.1%` vs `outputs/joint` `3.245 px`), and held-out fast-turn frames (`yaw ≥ 8 °/s`, 15 frames) drop **17.0%** (`4.242 → 3.519 px`, or `−18.1%` vs `outputs/joint` `4.294 px`). Adding tangential `p1, p2` degrades held-out error (`2.985 px`, fast `3.706 px`).
+- **Single minimum preserved:** Both fixed-pose and `(R, t, k1, k2)`-reoptimised `Δt` profiles across `[-200, +200] ms` remain strictly single-minimum around `+16.9 ms`.
+- **Caveats:** No ground truth; `ty` (`−0.106 m` vs `T0`’s `−0.282 m`, 17.6 cm shift) still needs verification against physical mount measurements; `K` itself (`fx, fy, cx, cy`) is held fixed from the notebook rather than re-calibrated on a checkerboard; deskew relies on LiDAR odometry (`r = 0.89` vs u-blox GPS, median ratio `1.07`); platform is slow (`≤ 3.7 m/s`), so `Δt` is observed mostly through turning.
 
 ## Legacy two-stage pipeline (baseline)
 
@@ -102,7 +119,9 @@ Calibration/
 │   ├── geometry.py, scoring.py
 │   ├── pose_warp.py, lines.py, dynamic_filter.py, extrinsic_refine.py
 │   ├── hybrid_sync.py, viz.py
-├── scripts/run_joint_calibration.py   # joint (R,t,Δt) calibration + validation → outputs/joint/
+├── docs/time_offset_reconciliation.md # −19.49 ms vs +16.9 ms sign & sweep reconciliation
+├── scripts/run_joint_calibration.py   # joint (R,t,Δt[,dist]) calibration + validation → outputs/joint[_distortion]/
+├── scripts/reconcile_time_offset.py   # empirical sweep/FOV/optical-flow reconciliation script
 ├── scripts/measure_densify.py   # edge-count densify ratio on a bag
 ├── tests/                 # pytest (joint calibration, geometry, stamp sync, densify measure, …)
 ├── papers/2207.10454.pdf, REFERENCES.md

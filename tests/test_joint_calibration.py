@@ -186,3 +186,87 @@ def test_scan_level_time_leaks_into_the_pose(synthetic_setup):
     R_t, t_t, _ = jc.params_to_pose(x_true, T_INIT)
     R_e, t_e, _ = jc.params_to_pose(sol.x, T_INIT)
     assert jc.rotation_angle_deg(R_t, R_e) > 0.5 or np.linalg.norm(t_e - t_t) > 0.03
+
+
+# ----------------------------------------------------------------------------- sign convention & distortion
+def test_time_offset_sign_convention_locked():
+    """Lock ``t_C = t_L + dt`` across both positive and negative ground-truth offsets."""
+    from calib.hybrid_sync import associate_camera_time
+
+    traj = make_traj()
+    segs = world_structures(seed=11)
+    Pw_sparse = sample(segs, 0.12)
+    Pw_dense = sample(segs, 0.01)
+
+    for dt_true in (0.018, -0.0195):
+        frames = []
+        for k in range(14):
+            stamp = 0.1 * k + 0.003
+            pts, t_abs = lidar_capture(traj, Pw_sparse, stamp)
+            t_fov = stamp + 0.075
+            # Under t_C = t_L + dt, the camera stamp matching LiDAR time t_fov is t_fov + dt_true.
+            s_C = associate_camera_time(t_fov, dt_true)
+            dtimg = render_dt(traj, Pw_dense, T_INIT, s_C - dt_true)
+            frames.append(jc.make_frame(traj, pts, t_abs, stamp, s_C, dtimg, k, k))
+        P = jc.JointProblem(frames, traj, K, T_INIT)
+        sol = jc.solve_joint(P, jc.pose_to_params(T_INIT, 0.0, T_INIT))
+        _, _, dt_est = jc.params_to_pose(sol.x, T_INIT)
+        assert dt_est == pytest.approx(dt_true, abs=0.002)
+
+
+def test_distortion_projection_matches_opencv():
+    rng = np.random.default_rng(5)
+    pC = rng.uniform([-2.0, -1.5, 4.0], [2.0, 1.5, 25.0], (50, 3))
+    dist4 = np.array([-0.32, 0.09, 0.002, -0.003])
+    xn, yn = pC[:, 0] / pC[:, 2], pC[:, 1] / pC[:, 2]
+    xd, yd, ok = jc.distort_normalized(xn, yn, dist4)
+    assert ok.all()
+    u = K[0, 0] * xd + K[0, 2]
+    v = K[1, 1] * yd + K[1, 2]
+    uv_cv, _ = cv2.projectPoints(pC, np.zeros(3), np.zeros(3), K, dist4)
+    uv_cv = uv_cv.reshape(-1, 2)
+    assert np.allclose(np.column_stack([u, v]), uv_cv, atol=1e-6)
+
+
+def test_joint_recovers_pose_time_and_radial_distortion():
+    traj = make_traj()
+    segs = world_structures(seed=2)
+    Pw_sparse = sample(segs, 0.12)
+    Pw_dense = sample(segs, 0.01)
+    x_true = np.array([np.radians(0.5), np.radians(-0.4), np.radians(0.6),
+                       0.03, -0.02, -0.04, 0.016, -0.32, 0.08])
+    R_t, t_t, dt_t = jc.params_to_pose(x_true[:7], T_INIT)
+    d_t = jc.params_to_dist4(x_true, "k1_k2")
+
+    frames = []
+    for k in range(14):
+        stamp = 0.1 * k + 0.003
+        pts, t_abs = lidar_capture(traj, Pw_sparse, stamp)
+        s_C = stamp + 0.0805
+        pL = world_to_lidar_at(traj, Pw_dense, s_C - dt_t)
+        pC = pL @ R_t.T + t_t
+        ok = pC[:, 2] > 1.0
+        xd, yd, rad_ok = jc.distort_normalized(pC[ok, 0] / pC[ok, 2], pC[ok, 1] / pC[ok, 2], d_t)
+        u = K[0, 0] * xd[rad_ok] + K[0, 2]
+        v = K[1, 1] * yd[rad_ok] + K[1, 2]
+        img = np.full((H, W), 255, np.uint8)
+        for a, b in zip(u, v):
+            if 0 <= a < W and 0 <= b < H:
+                img[int(b), int(a)] = 0
+        dtimg = np.minimum(cv2.distanceTransform(img, cv2.DIST_L2, 5), 40.0).astype(np.float32)
+        frames.append(jc.make_frame(traj, pts, t_abs, stamp, s_C, dtimg, k, k))
+
+    P = jc.JointProblem(
+        frames, traj, K, T_INIT,
+        dist_model="k1_k2",
+        dist_prior=([0.0, 0.0, 0.0, 0.0], [None, 0.5, None, None]),
+    )
+    x0 = np.r_[jc.pose_to_params(T_INIT, -0.0195, T_INIT), 0.0, 0.0]
+    sol = jc.solve_joint(P, x0, maxfev=6000)
+    R_e, t_e, dt_e = jc.params_to_pose(sol.x[:7], T_INIT)
+    d_e = sol.distortion("k1_k2")
+    assert abs(dt_e - dt_t) < 0.003
+    assert jc.rotation_angle_deg(R_t, R_e) < 0.2
+    assert np.linalg.norm(t_e - t_t) < 0.04
+    assert abs(d_e[0] - d_t[0]) < 0.05
+    assert not any(sol.at_bound.values())

@@ -32,7 +32,22 @@ from scipy.spatial.transform import Rotation
 
 from .trajectory import Trajectory, points_to_world
 
-PARAM_NAMES = ("rx", "ry", "rz", "tx", "ty", "tz", "dt")
+POSE_PARAM_NAMES = ("rx", "ry", "rz", "tx", "ty", "tz", "dt")
+DIST_MODELS = {
+    "none": (),
+    "k1": ("k1",),
+    "k1_k2": ("k1", "k2"),
+    "k1_k2_p1_p2": ("k1", "k2", "p1", "p2"),
+}
+DIST_BOUNDS = {
+    "k1": (-0.6, 0.6),
+    "k2": (-1.0, 1.0),
+    "p1": (-0.05, 0.05),
+    "p2": (-0.05, 0.05),
+}
+DIST_SCALE = {"k1": 0.02, "k2": 0.05, "p1": 0.002, "p2": 0.002}
+DIST_JAC_STEP = {"k1": 2e-3, "k2": 5e-3, "p1": 2e-4, "p2": 2e-4}
+PARAM_NAMES = POSE_PARAM_NAMES  # backward-compatible alias
 
 
 # --------------------------------------------------------------------------- features
@@ -148,12 +163,54 @@ def make_frame(
 
 
 # --------------------------------------------------------------------------- model
+def dist_param_names(dist_model: str = "none") -> tuple[str, ...]:
+    if dist_model not in DIST_MODELS:
+        raise ValueError(f"Unknown dist_model {dist_model!r}; expected one of {tuple(DIST_MODELS)}")
+    return DIST_MODELS[dist_model]
+
+
+def problem_param_names(dist_model: str = "none") -> tuple[str, ...]:
+    return POSE_PARAM_NAMES + dist_param_names(dist_model)
+
+
 def params_to_pose(x: Sequence[float], T0: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    """x = [rotvec (left increment on R0), Δtranslation, Δt] → (R, t, Δt)."""
+    """x[:7] = [rotvec (left increment on R0), Δtranslation, Δt] → (R, t, Δt)."""
     x = np.asarray(x, dtype=np.float64)
     R = Rotation.from_rotvec(x[:3]).as_matrix() @ T0[:3, :3]
     t = T0[:3, 3] + x[3:6]
     return R, t, float(x[6])
+
+
+def params_to_dist4(
+    x: Sequence[float],
+    dist_model: str = "none",
+    fixed_dist: Optional[Sequence[float]] = None,
+) -> np.ndarray:
+    """Extract (k1, k2, p1, p2) from ``x`` (or ``fixed_dist`` when ``x`` has length 7)."""
+    d4 = np.zeros(4, dtype=np.float64)
+    if fixed_dist is not None:
+        fd = np.asarray(fixed_dist, dtype=np.float64).reshape(-1)
+        d4[:min(len(fd), 4)] = fd[:4]
+    names = dist_param_names(dist_model)
+    x = np.asarray(x, dtype=np.float64)
+    if names and len(x) >= 7 + len(names):
+        for i, name in enumerate(names):
+            idx = ("k1", "k2", "p1", "p2").index(name)
+            d4[idx] = float(x[7 + i])
+    return d4
+
+
+def distort_normalized(xn: np.ndarray, yn: np.ndarray, dist4: Sequence[float]):
+    """Brown–Conrady distortion on normalized image coords; returns (xd, yd, rad_ok)."""
+    k1, k2, p1, p2 = (float(dist4[0]), float(dist4[1]), float(dist4[2]), float(dist4[3]))
+    if k1 == 0.0 and k2 == 0.0 and p1 == 0.0 and p2 == 0.0:
+        return xn, yn, np.ones(xn.shape, dtype=bool)
+    r2 = xn * xn + yn * yn
+    rad = 1.0 + k1 * r2 + k2 * (r2 * r2)
+    rad_ok = rad > 0.2  # guard against radial fold-back outside the FOV
+    xd = xn * rad + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn)
+    yd = yn * rad + p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn
+    return xd, yd, rad_ok
 
 
 def pose_to_params(T: np.ndarray, dt: float, T0: np.ndarray) -> np.ndarray:
@@ -185,8 +242,11 @@ class JointProblem:
     cap_px: float = 40.0
     min_depth: float = 1.0
     cauchy_px: float = 5.0            # robust scale (same 5 px as the repo's Gaussian edge score)
-    dt_prior: Optional[tuple] = None  # (mean_s, sigma_s)
-    t_prior: Optional[tuple] = None   # (mean_t (3,), sigma_m)
+    dt_prior: Optional[tuple] = None    # (mean_s, sigma_s)
+    t_prior: Optional[tuple] = None     # (mean_t (3,), sigma_m)
+    dist_model: str = "none"            # "none", "k1", "k1_k2", "k1_k2_p1_p2"
+    fixed_dist: Optional[Sequence[float]] = None  # optional fixed (k1,k2,p1,p2) when x has length 7
+    dist_prior: Optional[tuple] = None  # (mean_seq, sigma_seq); None/inf sigma = unregularised
     _offsets: List[int] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self):
@@ -208,7 +268,19 @@ class JointProblem:
         """
         return float(np.sqrt(self.n_points / max(len(self.frames), 1)))
 
-    def project(self, f: JointFrame, R: np.ndarray, t: np.ndarray, dt: float):
+    def _dist_prior_terms(self, dist4: np.ndarray) -> List[float]:
+        if not self.dist_prior:
+            return []
+        means, sigmas = self.dist_prior
+        w = self.prior_weight
+        terms = []
+        for val, mu, sig in zip(dist4, means, sigmas):
+            if sig is not None and np.isfinite(sig) and sig > 0:
+                terms.append(w * (float(val) - float(mu)) / float(sig))
+        return terms
+
+    def project(self, f: JointFrame, R: np.ndarray, t: np.ndarray, dt: float,
+                dist: Optional[Sequence[float]] = None):
         tau = f.cam_stamp - dt
         Rw, pw = self.traj.pose_at(tau)
         q = f.q_point if self.per_point else f.q_scan
@@ -217,13 +289,20 @@ class JointProblem:
         z = pC[:, 2]
         good = z > self.min_depth
         zs = np.where(good, z, 1.0)
-        u = self.K[0, 0] * pC[:, 0] / zs + self.K[0, 2]
-        v = self.K[1, 1] * pC[:, 1] / zs + self.K[1, 2]
+        xn = pC[:, 0] / zs
+        yn = pC[:, 1] / zs
+        if dist is None:
+            dist = self.fixed_dist if self.fixed_dist is not None else (0.0, 0.0, 0.0, 0.0)
+        xd, yd, rad_ok = distort_normalized(xn, yn, dist)
+        good &= rad_ok
+        u = self.K[0, 0] * xd + self.K[0, 2]
+        v = self.K[1, 1] * yd + self.K[1, 2]
         return u, v, good
 
-    def frame_distances(self, f: JointFrame, R, t, dt) -> tuple[np.ndarray, np.ndarray]:
+    def frame_distances(self, f: JointFrame, R, t, dt,
+                        dist: Optional[Sequence[float]] = None) -> tuple[np.ndarray, np.ndarray]:
         """Edge distance per point (px) and an in-image mask."""
-        u, v, good = self.project(f, R, t, dt)
+        u, v, good = self.project(f, R, t, dt, dist=dist)
         h, w = f.dt_img.shape
         inside = good & (u >= 0) & (u <= w - 1) & (v >= 0) & (v <= h - 1)
         d = np.full(u.shape, self.cap_px, dtype=np.float64)
@@ -234,7 +313,8 @@ class JointProblem:
                                   borderMode=cv2.BORDER_CONSTANT, borderValue=self.cap_px).reshape(-1)
         return d, inside
 
-    def frame_rho(self, f: JointFrame, R, t, dt) -> np.ndarray:
+    def frame_rho(self, f: JointFrame, R, t, dt,
+                  dist: Optional[Sequence[float]] = None) -> np.ndarray:
         """Per-point Cauchy cost ``ρ = ln(1 + (d/c)^2)``.
 
         Points that leave the image get the frame's mean in-image cost, so
@@ -242,7 +322,7 @@ class JointProblem:
         this, a fixed out-of-image penalty biases the solution toward shrinking
         the projection (camera moved back, or deskew to an earlier time).
         """
-        d, inside = self.frame_distances(f, R, t, dt)
+        d, inside = self.frame_distances(f, R, t, dt, dist=dist)
         rho = np.log1p((d / self.cauchy_px) ** 2)
         if not inside.all():
             rho[~inside] = rho[inside].mean() if inside.any() else np.log1p((self.cap_px / self.cauchy_px) ** 2)
@@ -250,10 +330,12 @@ class JointProblem:
 
     def residuals(self, x: Sequence[float], frame_weights: Optional[np.ndarray] = None) -> np.ndarray:
         R, t, dt = params_to_pose(x, self.T0)
-        n_prior = (1 if self.dt_prior else 0) + (3 if self.t_prior else 0)
+        dist4 = params_to_dist4(x, self.dist_model, self.fixed_dist)
+        d_terms = self._dist_prior_terms(dist4)
+        n_prior = (1 if self.dt_prior else 0) + (3 if self.t_prior else 0) + len(d_terms)
         out = np.empty(self.n_points + n_prior)
         for i, f in enumerate(self.frames):
-            r = np.sqrt(self.frame_rho(f, R, t, dt))
+            r = np.sqrt(self.frame_rho(f, R, t, dt, dist=dist4))
             if frame_weights is not None:
                 r = r * np.sqrt(frame_weights[i])
             out[self._offsets[i]:self._offsets[i + 1]] = r
@@ -266,6 +348,10 @@ class JointProblem:
         if self.t_prior:
             mu, sig = self.t_prior
             out[k:k + 3] = w * (t - np.asarray(mu, float)) / sig
+            k += 3
+        for term in d_terms:
+            out[k] = term
+            k += 1
         return out
 
     def cost(self, x: Sequence[float], frame_weights: Optional[np.ndarray] = None) -> float:
@@ -274,19 +360,21 @@ class JointProblem:
 
     def median_distance(self, x: Sequence[float], frames: Optional[Sequence[int]] = None) -> float:
         R, t, dt = params_to_pose(x, self.T0)
+        dist4 = params_to_dist4(x, self.dist_model, self.fixed_dist)
         idx = range(len(self.frames)) if frames is None else frames
         ds = []
         for i in idx:
-            d, inside = self.frame_distances(self.frames[i], R, t, dt)
+            d, inside = self.frame_distances(self.frames[i], R, t, dt, dist=dist4)
             ds.append(d[inside])
         allv = np.concatenate(ds) if ds else np.array([np.nan])
         return float(np.median(allv))
 
     def per_frame_median(self, x: Sequence[float]) -> np.ndarray:
         R, t, dt = params_to_pose(x, self.T0)
+        dist4 = params_to_dist4(x, self.dist_model, self.fixed_dist)
         out = []
         for f in self.frames:
-            d, inside = self.frame_distances(f, R, t, dt)
+            d, inside = self.frame_distances(f, R, t, dt, dist=dist4)
             out.append(float(np.median(d[inside])) if inside.any() else np.nan)
         return np.asarray(out)
 
@@ -317,79 +405,116 @@ class JointSolution:
         R, t, dt = params_to_pose(self.x, T0)
         return make_T(R, t), dt
 
+    def distortion(self, dist_model: str = "none") -> np.ndarray:
+        return params_to_dist4(self.x, dist_model)
 
-def _at_bound(x, bounds, free) -> Dict[str, bool]:
+
+def problem_bounds(dist_model: str = "none") -> tuple[np.ndarray, np.ndarray]:
+    names = dist_param_names(dist_model)
+    if not names:
+        return DEFAULT_BOUNDS
+    lo = np.r_[DEFAULT_BOUNDS[0], [DIST_BOUNDS[n][0] for n in names]]
+    hi = np.r_[DEFAULT_BOUNDS[1], [DIST_BOUNDS[n][1] for n in names]]
+    return lo, hi
+
+
+def problem_scales(dist_model: str = "none") -> np.ndarray:
+    names = dist_param_names(dist_model)
+    if not names:
+        return X_SCALE
+    return np.r_[X_SCALE, [DIST_SCALE[n] for n in names]]
+
+
+def problem_jac_steps(dist_model: str = "none") -> np.ndarray:
+    names = dist_param_names(dist_model)
+    if not names:
+        return JAC_STEP
+    return np.r_[JAC_STEP, [DIST_JAC_STEP[n] for n in names]]
+
+
+def _at_bound(x, bounds, free, names) -> Dict[str, bool]:
     span = bounds[1] - bounds[0]
     return {n: bool(free[i] and min(x[i] - bounds[0][i], bounds[1][i] - x[i]) < 2e-3 * span[i])
-            for i, n in enumerate(PARAM_NAMES)}
+            for i, n in enumerate(names)}
 
 
 def solve_joint(
     problem: JointProblem,
     x0: Sequence[float],
-    bounds=DEFAULT_BOUNDS,
+    bounds=None,
     scales: Sequence[float] = (15.0, 5.0),
     frame_weights: Optional[np.ndarray] = None,
     fix_mask: Optional[Sequence[bool]] = None,
-    maxfev: int = 4000,
+    maxfev: int = 5000,
 ) -> JointSolution:
-    """One optimiser over all seven parameters (R, t, Δt) at once.
+    """One optimiser over (R, t, Δt) and any active distortion parameters at once.
 
     The edge-distance cost is piecewise smooth but rough at the pixel scale
     (bilinear DT, many nearby edges), and gradient steps from finite
     differences stall in it. A bounded Powell search on normalised parameters
     is used instead, with a coarse-to-fine robust scale (Cauchy 15 px, then
-    5 px) as continuation. Both stages move R, t and Δt together; nothing is
-    estimated in a separate stage.
+    5 px) as continuation. Both stages move all active parameters together;
+    nothing is estimated in a separate stage.
 
     ``fix_mask`` freezes parameters and is used only for diagnostics (Δt
     profile, per-window Δt), never for the main joint estimate.
     """
     from scipy.optimize import minimize
 
+    names = problem_param_names(problem.dist_model)
+    ndim = len(names)
+    if bounds is None:
+        bounds = problem_bounds(problem.dist_model)
     lo, hi = bounds
-    x0 = np.clip(np.asarray(x0, float), lo, hi)
-    free = np.ones(7, bool) if fix_mask is None else ~np.asarray(fix_mask, bool)
-    x = x0.copy()
+    x0_arr = np.asarray(x0, float)
+    if x0_arr.size == 7 and ndim > 7:
+        x0_arr = np.r_[x0_arr, np.zeros(ndim - 7)]
+    x0_arr = np.clip(x0_arr, lo, hi)
+    xscale = problem_scales(problem.dist_model)
+    free = np.ones(ndim, bool) if fix_mask is None else ~np.asarray(fix_mask, bool)
+    x = x0_arr.copy()
     nfev = 0
     for c in scales:
         problem.cauchy_px = float(c)
 
         def f(z):
             xx = x.copy()
-            xx[free] = np.clip(z * X_SCALE[free], lo[free], hi[free])
+            xx[free] = np.clip(z * xscale[free], lo[free], hi[free])
             return problem.cost(xx, frame_weights)
 
         res = minimize(
-            f, x[free] / X_SCALE[free], method="Powell",
-            bounds=list(zip(lo[free] / X_SCALE[free], hi[free] / X_SCALE[free])),
+            f, x[free] / xscale[free], method="Powell",
+            bounds=list(zip(lo[free] / xscale[free], hi[free] / xscale[free])),
             options={"xtol": 1e-3, "ftol": 1e-7, "maxfev": maxfev},
         )
-        x[free] = np.clip(res.x * X_SCALE[free], lo[free], hi[free])
+        x[free] = np.clip(res.x * xscale[free], lo[free], hi[free])
         nfev += int(res.nfev)
     problem.cauchy_px = float(scales[-1])
-    return JointSolution(x, problem.cost(x, frame_weights), nfev, _at_bound(x, bounds, free), x0)
+    return JointSolution(x, problem.cost(x, frame_weights), nfev, _at_bound(x, bounds, free, names), x0_arr)
 
 
-def numerical_jacobian(problem: JointProblem, x: np.ndarray, steps: np.ndarray = JAC_STEP) -> np.ndarray:
+def numerical_jacobian(problem: JointProblem, x: np.ndarray, steps: Optional[np.ndarray] = None) -> np.ndarray:
     """Central-difference Jacobian of the sqrt-Cauchy residual vector."""
+    if steps is None:
+        steps = problem_jac_steps(problem.dist_model)
+    ndim = len(x)
     cols = []
-    for i in range(7):
-        e = np.zeros(7)
+    for i in range(ndim):
+        e = np.zeros(ndim)
         e[i] = steps[i]
         cols.append((problem.residuals(x + e) - problem.residuals(x - e)) / (2 * steps[i]))
     return np.stack(cols, axis=1)
 
 
 def gauss_newton_covariance(problem: JointProblem, x: np.ndarray) -> np.ndarray:
-    """(JᵀJ)⁻¹·s² at the optimum, with s² = Σr²/(N−7).
+    """(JᵀJ)⁻¹·s² at the optimum, with s² = Σr²/(N−p).
 
     Treats residuals as independent, so it is optimistic (points within a
     frame are correlated); the frame bootstrap is the more honest spread.
     """
     J = numerical_jacobian(problem, x)
     r = problem.residuals(x)
-    s2 = float(r @ r) / max(r.size - 7, 1)
+    s2 = float(r @ r) / max(r.size - len(x), 1)
     return np.linalg.pinv(J.T @ J) * s2
 
 
