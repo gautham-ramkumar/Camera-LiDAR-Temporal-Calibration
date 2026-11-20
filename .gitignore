@@ -5,3 +5,4 @@ __pycache__/
 calib_eval_outputs/
 .venv/
 .pytest_cache/
+outputs/

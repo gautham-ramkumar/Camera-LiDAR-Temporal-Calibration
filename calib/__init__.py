@@ -1,4 +1,9 @@
-"""Camera–LiDAR hybrid temporal sync (stamp-primary + paper-closer residual)."""
+"""Camera–LiDAR calibration.
+
+Primary: joint (R, t, Δt) estimation with per-point LiDAR deskew
+(:mod:`calib.joint_calib`, ``scripts/run_joint_calibration.py``).
+Legacy baseline: two-stage stamp-primary hybrid sync (:mod:`calib.hybrid_sync`).
+"""
 
 from .camera import CameraPipeline
 from .dynamic_filter import apply_dynamic_filter_to_scans, filter_dynamic_points
@@ -22,6 +27,16 @@ from .hybrid_sync import (
     stamp_sync_stats,
 )
 from .imu import IMUPreintegrator
+from .joint_calib import (
+    JointFrame,
+    JointProblem,
+    JointSolution,
+    gauss_newton_covariance,
+    image_distance_transform,
+    lidar_depth_edges,
+    solve_joint,
+)
+from .trajectory import Trajectory, deskew_points
 from .lidar import densify_lidar_scans, extract_edges, project_to_range_image
 from .lines import apply_line_dt_to_pipeline, image_line_mask
 from .pose_warp import relative_motion, warp_scan_to_camera_time
@@ -42,6 +57,15 @@ from .viz import (
 )
 
 __all__ = [
+    "JointFrame",
+    "JointProblem",
+    "JointSolution",
+    "solve_joint",
+    "gauss_newton_covariance",
+    "image_distance_transform",
+    "lidar_depth_edges",
+    "Trajectory",
+    "deskew_points",
     "McapTimeWindowExtractor",
     "IMUPreintegrator",
     "CameraPipeline",
